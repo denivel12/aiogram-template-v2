@@ -1,0 +1,1 @@
+echo-no_text = Please provide some text to echo. Usage: /echo [your text]

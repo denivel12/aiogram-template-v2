@@ -26,17 +26,12 @@ class Base(DeclarativeBase):
 
 
 async def create_db_pool(
-    settings: Settings, is_migration: bool = False
+    settings: Settings,
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
     engine: AsyncEngine = create_async_engine(
-        settings.psql_dsn(is_migration=is_migration),
+        settings.psql_dsn(),
         echo=settings.dev,
-        max_overflow=10,
-        pool_size=100,
+        pool_pre_ping=True,
     )
 
     return engine, async_sessionmaker(engine, expire_on_commit=False)
-
-
-async def close_db_pool(engine: AsyncEngine) -> None:
-    await engine.dispose()

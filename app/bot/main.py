@@ -23,67 +23,46 @@ from aiogram.webhook.security import DEFAULT_TELEGRAM_NETWORKS, IPFilter
 from aiogram_i18n import I18nMiddleware
 from aiogram_i18n.cores import FluentRuntimeCore
 from aiohttp import web
+from redis.asyncio import Redis
 
-import errors
-import handlers
+from errors import get_errors_router
+from handlers import get_handlers_router
 from middlewares.check_chat_middleware import CheckChatMiddleware
 from middlewares.check_user_middleware import CheckUserMiddleware
+from middlewares.database_middleware import DatabaseMiddleware
 from middlewares.throttling_middleware import ThrottlingMiddleware
 from settings import Settings
-from storages.psql.base import close_db_pool, create_db_pool
+from storages.psql.base import create_db_pool
 from utils.fsm_manager import FSMManager
 
-if TYPE_CHECKING:
-    from redis.asyncio import Redis
-
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-logger = logging.getLogger()
 
-
-async def startup(dispatcher: Dispatcher, bot: Bot, settings: Settings, redis: Redis) -> None:
-    await bot.delete_webhook(drop_pending_updates=True)
-
+async def on_startup(dispatcher: Dispatcher, bot: Bot, settings: Settings) -> None:
     if settings.webhooks:
         await bot.set_webhook(
             url=settings.webhook_url.get_secret_value(),
             allowed_updates=dispatcher.resolve_used_update_types(),
             secret_token=settings.webhook_secret_token.get_secret_value(),
+            drop_pending_updates=True,
         )
-
-    engine, db_pool = await create_db_pool(settings)
-
-    dispatcher.workflow_data.update(
-        {"db_pool": db_pool, "db_pool_closer": partial(close_db_pool, engine)},
-    )
-
-    dispatcher.message.middleware(ThrottlingMiddleware(redis))
-    dispatcher.callback_query.middleware(ThrottlingMiddleware(redis))
-
-    dispatcher.update.outer_middleware(CheckChatMiddleware())
-    dispatcher.update.outer_middleware(CheckUserMiddleware())
-
-    i18n_middleware = I18nMiddleware(
-        core=FluentRuntimeCore(path=Path(__file__).parent / "locales" / "{locale}"),
-        manager=FSMManager(),
-    )
-    i18n_middleware.setup(dispatcher=dispatcher)
-    await i18n_middleware.core.startup()
+    else:
+        await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Bot started")
 
 
-async def shutdown(dispatcher: Dispatcher) -> None:
-    await dispatcher["db_pool_closer"]()
+async def on_shutdown(dispatcher: Dispatcher, bot: Bot) -> None:
+    logger.info("Stopping bot...")
+    await bot.session.close()
+    await dispatcher.storage.close()
     logger.info("Bot stopped")
 
 
 async def main() -> None:
     settings = Settings()
 
-    # TelegramLocalBotAPIServer
-    # api = TelegramAPIServer.from_base("http://telegram-bot-api:8081")
-    # api = TelegramAPIServer.from_base("http://localhost:8081")
     api = TEST if settings.test_server is True else PRODUCTION
 
     bot = Bot(
@@ -92,23 +71,44 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode="HTML"),
     )
 
+    redis = Redis.from_url(settings.redis_dsn())
     storage = RedisStorage(
-        redis=await settings.redis_dsn(),
+        redis=redis,
         key_builder=DefaultKeyBuilder(with_bot_id=True, with_destiny=True),
         json_loads=msgspec.json.decode,
         json_dumps=partial(lambda obj: str(msgspec.json.encode(obj), encoding="utf-8")),
     )
 
+    engine, session_pool = await create_db_pool(settings)
+
     dp = Dispatcher(
         storage=storage,
         events_isolation=SimpleEventIsolation(),
         settings=settings,
-        redis=storage.redis,
-        developer_id=settings.developer_id,
     )
-    dp.include_routers(handlers.router, errors.router)
-    dp.startup.register(startup)
-    dp.shutdown.register(shutdown)
+
+    # Register routers
+    dp.include_router(get_handlers_router())
+    dp.include_router(get_errors_router())
+
+    # Register middlewares
+    dp.update.outer_middleware(DatabaseMiddleware(session_pool=session_pool))
+    dp.update.outer_middleware(CheckChatMiddleware())
+    dp.update.outer_middleware(CheckUserMiddleware())
+
+    dp.message.middleware(ThrottlingMiddleware(redis))
+    dp.callback_query.middleware(ThrottlingMiddleware(redis))
+
+    i18n_middleware = I18nMiddleware(
+        core=FluentRuntimeCore(path=Path(__file__).parent / "locales" / "{locale}"),
+        manager=FSMManager(),
+    )
+    i18n_middleware.setup(dispatcher=dispatcher)
+    await i18n_middleware.core.startup()
+
+    # Register startup/shutdown hooks
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
 
     if settings.webhooks:
         app = web.Application(
@@ -122,14 +122,18 @@ async def main() -> None:
         ).register(app, "/webhook")
         setup_application(app, dp, bot=bot)
 
-        await web._run_app(app, host="0.0.0.0", port=8080)  # noqa: S104, SLF001
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=8080)
+        await site.start()
+        await asyncio.Event().wait()
 
     else:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
-    # Aiogram automatically sets the event loop policy to uvloop if available.
-    # I really don't like it, because it should be set by the developer.
-    # Developer decides which event loop to use.
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.error("Bot stopped!")
