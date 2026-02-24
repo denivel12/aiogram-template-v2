@@ -85,6 +85,7 @@ async def main() -> None:
         storage=storage,
         events_isolation=SimpleEventIsolation(),
         settings=settings,
+        redis=redis,
     )
 
     # Register routers
@@ -103,7 +104,7 @@ async def main() -> None:
         core=FluentRuntimeCore(path=Path(__file__).parent / "locales" / "{locale}"),
         manager=FSMManager(),
     )
-    i18n_middleware.setup(dispatcher=dispatcher)
+    i18n_middleware.setup(dispatcher=dp)
     await i18n_middleware.core.startup()
 
     # Register startup/shutdown hooks

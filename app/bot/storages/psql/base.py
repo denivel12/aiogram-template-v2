@@ -35,3 +35,9 @@ async def create_db_pool(
     )
 
     return engine, async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def close_db_pool(
+    engine: AsyncEngine,
+) -> None:
+    await engine.dispose()

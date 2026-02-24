@@ -219,3 +219,148 @@ Bot may use webhooks. To enable webhooks, set `WEBHOOKS` environment variable to
 `WEBHOOK_URL` and `WEBHOOK_SECRET_TOKEN` environment variables.
 
 Don't forget to uncomment the `caddy` service in the `docker-compose.yml` file.
+
+***
+
+## Architecture & Key Decisions
+
+### Middleware Dependency Injection
+
+The template uses a middleware-based dependency injection pattern to provide database sessions,
+Redis connections, and other dependencies to handlers. Understanding this flow is crucial for
+extending the bot.
+
+#### Data Flow Through Middlewares
+
+When an update arrives from Telegram, it passes through the following middleware chain:
+
+```
+Update → DatabaseMiddleware → CheckChatMiddleware → CheckUserMiddleware → Handler
+```
+
+Each middleware can add data to the `data` dictionary, which is then available to subsequent
+middlewares and the final handler.
+
+#### Key Dependencies in `data` Dictionary
+
+| Key | Source | Description |
+|-----|--------|-------------|
+| `session` | `DatabaseMiddleware` | SQLAlchemy `AsyncSession` for database operations |
+| `db_pool` | `DatabaseMiddleware` | `async_sessionmaker` for creating new sessions |
+| `redis` | `Dispatcher` | Redis client instance for caching |
+| `settings` | `Dispatcher` | Bot settings instance |
+| `user_model` | `CheckUserMiddleware` | Redis-cached user model (for private chats) |
+| `user_settings` | `CheckUserMiddleware` | Redis-cached user settings |
+| `chat_model` | `CheckChatMiddleware` | Redis-cached chat model (for groups/supergroups) |
+| `chat_settings` | `CheckChatMiddleware` | Redis-cached chat settings |
+
+#### Why `db_pool` and `session` Both Exist
+
+- **`session`**: A single database session for the current request lifecycle. Use this for most
+  database operations in handlers.
+
+- **`db_pool`**: The session factory (`async_sessionmaker`). Use this when you need to create
+  separate sessions with different transaction scopes, such as in background tasks or when
+  you need independent transactions.
+
+Example usage in a handler:
+
+```python
+from typing import TYPE_CHECKING
+from aiogram.types import Message
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from redis.asyncio import Redis
+
+async def my_handler(
+    message: Message,
+    session: AsyncSession,  # Provided by DatabaseMiddleware
+    db_pool: async_sessionmaker[AsyncSession],  # Provided by DatabaseMiddleware
+    redis: Redis,  # Provided by Dispatcher
+) -> None:
+    # Use session for simple operations
+    result = await session.execute(select(User).where(User.id == message.from_user.id))
+    
+    # Use db_pool for separate transaction scope
+    async with db_pool() as new_session:
+        # This is a separate transaction
+        await new_session.execute(...)
+        await new_session.commit()
+```
+
+### Redis Caching Strategy
+
+The template implements a two-layer caching strategy:
+
+1. **Redis Cache (Fast)**: User and chat data is cached in Redis for quick access
+2. **PostgreSQL (Persistent)**: Authoritative data storage
+
+When `CheckUserMiddleware` or `CheckChatMiddleware` runs, they first check Redis for cached
+data. If not found, they fetch from PostgreSQL and cache it in Redis. This reduces database
+load and improves response times.
+
+### Middleware Registration Order
+
+The order of middleware registration in [`main.py`](app/bot/main.py) is important:
+
+```python
+# Outer middlewares run first (in order of registration)
+dp.update.outer_middleware(DatabaseMiddleware(session_pool=session_pool))
+dp.update.outer_middleware(CheckChatMiddleware())
+dp.update.outer_middleware(CheckUserMiddleware())
+
+# Inner middlewares run after outer middlewares
+dp.message.middleware(ThrottlingMiddleware(redis))
+dp.callback_query.middleware(ThrottlingMiddleware(redis))
+```
+
+- **Outer middlewares**: Run for all update types. Used for core functionality like database
+  sessions and user/chat resolution.
+
+- **Inner middlewares**: Run for specific event types (message, callback_query). Used for
+  event-specific logic like throttling.
+
+### Adding New Dependencies
+
+To add a new dependency available to all handlers:
+
+1. **Via Dispatcher** (recommended for single instances like clients):
+
+   ```python
+   dp = Dispatcher(
+       storage=storage,
+       my_client=my_client,  # Will be available as data["my_client"]
+   )
+   ```
+
+2. **Via Middleware** (for per-request instances or complex logic):
+
+   ```python
+   class MyMiddleware(BaseMiddleware):
+       def __init__(self, dependency):
+           self.dependency = dependency
+       
+       async def __call__(self, handler, event, data):
+           data["my_dependency"] = self.dependency
+           return await handler(event, data)
+   
+   dp.update.outer_middleware(MyMiddleware(my_dependency))
+   ```
+
+### Demo Commands
+
+The template includes demo commands to showcase the architecture:
+
+- `/start` - Basic start command with localization
+- `/help` - Shows help information
+- `/info` - Displays user information from the database
+- `/test` - Tests PostgreSQL and Redis connectivity
+- `/language` - Changes user's language preference
+
+These commands demonstrate:
+- Dependency injection in handlers
+- Database operations with SQLAlchemy
+- Redis caching
+- Localization with aiogram-i18n
+- Keyboard builders and callback queries

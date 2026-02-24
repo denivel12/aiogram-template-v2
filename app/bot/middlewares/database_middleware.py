@@ -21,6 +21,7 @@ class DatabaseMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        data["db_pool"] = self.session_pool
         async with self.session_pool() as session:
             data["session"] = session
             return await handler(event, data)
